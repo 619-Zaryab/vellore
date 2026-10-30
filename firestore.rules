@@ -1,0 +1,127 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    // Admin = a document in /admins/{uid} (created by hand in the Firebase console) OR the "admin" custom claim.
+    function isAdmin() { return signedIn() && (request.auth.token.admin == true || exists(/databases/$(database)/documents/admins/$(request.auth.uid))); }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+    // Admins can block an account; blocked customers cannot order or review.
+    function isBlocked() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('blocked', false) == true;
+    }
+
+    match /admins/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow write: if isAdmin();
+    }
+
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['uid','displayName','email','phone','photoURL','addresses','newsletter','createdAt','updatedAt'])
+        && request.resource.data.uid == uid
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.addresses.size() <= 10;
+      // Customers can only touch profile fields (never "blocked").
+      allow update: if (isOwner(uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName','phone','photoURL','addresses','newsletter','updatedAt'])
+        && request.resource.data.addresses.size() <= 10) || isAdmin();
+      allow delete: if false;
+    }
+
+    match /products/{id} {
+      allow read: if resource.data.status == 'active' || isAdmin();
+      allow write: if isAdmin();
+    }
+
+    match /categories/{id} { allow read: if true; allow write: if isAdmin(); }
+    match /promotions/{id} { allow read: if resource.data.active == true || isAdmin(); allow write: if isAdmin(); }
+    match /storeSettings/{id} { allow read: if true; allow write: if isAdmin(); }
+
+    match /carts/{uid} {
+      allow read, delete: if isOwner(uid);
+      allow create, update: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['items','updatedAt'])
+        && request.resource.data.items.size() <= 50;
+    }
+
+    match /wishlists/{uid} {
+      allow read, delete: if isOwner(uid);
+      allow create, update: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['ids','updatedAt'])
+        && request.resource.data.ids.size() <= 200;
+    }
+
+    // Customers may CREATE their own order, only as "pending", and may CANCEL it while it is still pending.
+    // Confirming, stock, payment status and refunds are admin-only.
+    match /orders/{id} {
+      allow read: if signedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if signedIn() && !isBlocked()
+        && request.resource.data.userId == request.auth.uid
+        && id == request.auth.uid + '_' + request.resource.data.clientOrderId
+        && request.resource.data.status == 'pending'
+        && request.resource.data.paymentStatus in ['unpaid', 'pending']
+        && request.resource.data.paymentMethod in ['cod', 'jazzcash', 'easypaisa']
+        && request.resource.data.items.size() > 0 && request.resource.data.items.size() <= 30
+        && request.resource.data.total is number && request.resource.data.total >= 0
+        && request.resource.data.stockDeducted == false
+        && request.resource.data.createdAt == request.time;
+      allow update: if isAdmin()
+        || (signedIn() && resource.data.userId == request.auth.uid && resource.data.status == 'pending'
+            && request.resource.data.status == 'cancelled'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','statusHistory','cancelledAt','updatedAt']));
+      allow delete: if false;
+    }
+
+    match /reviews/{id} {
+      allow read: if resource.data.hidden == false || isAdmin();
+      allow create: if signedIn() && !isBlocked()
+        && id == request.auth.uid + '_' + request.resource.data.productId
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.hidden == false
+        && request.resource.data.rating is int && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
+        && request.resource.data.comment.size() >= 10 && request.resource.data.comment.size() <= 1000;
+      allow update: if isAdmin()
+        || (signedIn() && !isBlocked() && resource.data.userId == request.auth.uid
+            && request.resource.data.hidden == resource.data.hidden
+            && request.resource.data.rating is int && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
+            && request.resource.data.comment.size() >= 10 && request.resource.data.comment.size() <= 1000);
+      allow delete: if isAdmin();
+    }
+
+    // A signed-in customer can look up a coupon by its exact code (to validate it); only admins can list or edit.
+    match /coupons/{code} {
+      allow get: if signedIn();
+      allow list, write: if isAdmin();
+      match /usages/{uid} {
+        allow read: if isOwner(uid) || isAdmin();
+        allow write: if isAdmin();
+      }
+    }
+
+    match /inventoryLogs/{id} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && request.resource.data.adminId == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /contactMessages/{id} {
+      allow create: if request.resource.data.keys().hasOnly(['name','email','subject','message','read','createdAt'])
+        && request.resource.data.message.size() < 2000
+        && request.resource.data.read == false;
+      allow read, update: if isAdmin();
+    }
+
+    match /newsletter/{email} {
+      allow create: if email.matches('.+@.+\\..+')
+        && request.resource.data.keys().hasOnly(['email','createdAt'])
+        && request.resource.data.email == email;
+      allow read: if isAdmin();
+    }
+
+    match /notifications/{id} { allow read, write: if isAdmin(); }
+    match /analyticsSummaries/{id} { allow read, write: if isAdmin(); }
+  }
+}
